@@ -1,0 +1,12 @@
+# video-transcriber 依赖
+# 安装：双击「安装依赖.bat」，或手动执行  pip install -r requirements.txt
+faster-whisper>=1.0.0
+numpy>=1.24
+imageio-ffmpeg>=0.4.9
+
+# 说明：
+#   * ffmpeg 已随工具内置在 bin\ffmpeg.exe，正常情况下无需额外安装；
+#     imageio-ffmpeg 仅作为备用来源（内置缺失时自动回退使用）。
+#   * 若目标电脑不能联网，可先在有网的机器上执行
+#     pip download -r requirements.txt -d wheels   ，再把 wheels 目录一起带走，
+#     在目标机上执行  pip install --no-index --find-links wheels -r requirements.txt 。

@@ -1,0 +1,15 @@
+# 大文件：超过 GitHub 单文件 100MB 上限，未入库
+models/small/model.bin
+bin/ffmpeg.exe
+
+# 本机相关
+python_path.txt
+
+# 运行产物 / 缓存
+__pycache__/
+*.pyc
+ui_error.log
+*.log
+_scratch/
+.tmp*/
+*.tmp
