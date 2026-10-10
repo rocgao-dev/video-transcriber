@@ -41,10 +41,9 @@
 
 本仓库**只含代码**——模型 `model.bin`（约 480 MB）超过 GitHub 单文件上限，未入库。克隆后补两步：
 
-1. **装依赖**：双击 `安装依赖.bat`（需联网，首次几分钟）。
-2. **下载模型**：双击 `下载模型.bat`，自动把 `model.bin` 下载到 `models/small/`。
+**双击 `一键启动.bat` 即可** —— 自动完成「检测 Python → 装依赖 → 下载模型 → 打开界面」，首次联网约几分钟。
 
-之后双击 `启动简单UI.bat` 即可使用。
+也可分步操作：`安装依赖.bat` → `下载模型.bat` → `启动简单UI.bat`。
 
 > 手动下载：模型来自魔搭 <https://modelscope.cn/models/pengzhendong/faster-whisper-small>，
 > 把 `model.bin` 放到 `models/small/` 即可。
@@ -65,9 +64,17 @@ video-transcriber/
 ├─ models/
 │   ├─ small/           模型目录（含 config / tokenizer / vocabulary）
 │   └─ README.txt       模型说明（model.bin 需另行下载）
-├─ 下载模型.bat         一键下载模型 model.bin（约 480 MB）
+├─ 一键启动.bat         一键启动（装依赖 + 下模型 + 开界面）
+├─ 下载模型.bat         单独下载模型 model.bin（约 480 MB）
 └─ README.md
 ```
+
+## 🚀 一键启动（最省事，推荐）
+
+**双击 `一键启动.bat`** —— 自动完成「检测 Python → 装依赖 → 下载模型 → 打开界面」。
+首次需联网、约几分钟；之后每次双击即直接开界面。
+
+> 遇到问题可改用下面「快速开始」的分步方式逐一排查。
 
 ## 快速开始
 

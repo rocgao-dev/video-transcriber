@@ -31,4 +31,4 @@ if exist "%OUT%" (
   echo         model.bin manually from the ModelScope link above.
 )
 echo.
-pause
+if /i not "%~1"=="quiet" pause
