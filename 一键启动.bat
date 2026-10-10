@@ -74,7 +74,7 @@ for %%F in ("%VTPY%") do set "PYDIR=%%~dpF"
 if exist "%PYDIR%pythonw.exe" set "PYW=%PYDIR%pythonw.exe"
 start "" "%PYW%" "%~dp0ui_simple.py"
 echo Simple UI started.
-timeout /t 2 >nul
+timeout /t 2 >nul 2>nul
 exit /b 0
 
 :nopy
