@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import socket
 import sys
@@ -27,8 +28,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transcribe as engine  # noqa: E402
 
 JOBS = {}
+BATCHES = {}
+JOB_QUEUE = queue.Queue()
 LOCK = threading.Lock()
 TMP_DIR = tempfile.mkdtemp(prefix="vt_web_")
+_WORKER_STARTED = False
 
 
 def _log(job, msg):
@@ -38,18 +42,41 @@ def _log(job, msg):
             del job["logs"][:1000]
 
 
-def start_job(media, params):
+def _ensure_worker():
+    """启动唯一后台工作线程：多个文件按提交顺序依次转写，避免同时抢 CPU。"""
+    global _WORKER_STARTED
+    if _WORKER_STARTED:
+        return
+    _WORKER_STARTED = True
+    threading.Thread(target=_worker_loop, daemon=True).start()
+
+
+def _worker_loop():
+    while True:
+        jid, media, params = JOB_QUEUE.get()
+        try:
+            _run_job(jid, media, params)
+        finally:
+            JOB_QUEUE.task_done()
+
+
+def start_job(media, params, batch_id=None, name=None):
     jid = uuid.uuid4().hex[:12]
-    job = {"id": jid, "state": "running", "logs": [], "result": None, "error": None,
-           "out_path": None, "media": media, "seg_count": 0, "t0": time.time()}
+    job = {"id": jid, "state": "queued", "logs": [], "result": None, "error": None,
+           "out_path": None, "media": media, "seg_count": 0, "t0": time.time(),
+           "batch": batch_id, "name": name or os.path.basename(media)}
     with LOCK:
         JOBS[jid] = job
-    threading.Thread(target=_run_job, args=(jid, media, params), daemon=True).start()
+    _ensure_worker()
+    JOB_QUEUE.put((jid, media, params))
     return jid
 
 
 def _run_job(jid, media, params):
     job = JOBS[jid]
+    with LOCK:
+        job["state"] = "running"
+        job["t0"] = time.time()
 
     def on_status(m):
         _log(job, m)
@@ -90,7 +117,8 @@ def _run_job(jid, media, params):
 
 
 def _parse_multipart(body: bytes, boundary: bytes):
-    fields, files = {}, {}
+    """解析 multipart。files 为列表，支持同一字段名出现多次（多文件上传）。"""
+    fields, files = {}, []
     delim = b"--" + boundary
     for part in body.split(delim):
         part = part.strip(b"\r\n")
@@ -106,7 +134,7 @@ def _parse_multipart(body: bytes, boundary: bytes):
         name = m.group(1)
         fn = re.search(r'filename="([^"]*)"', head_txt)
         if fn and fn.group(1):
-            files[name] = (fn.group(1), data)
+            files.append({"name": name, "filename": fn.group(1), "data": data})
         else:
             fields[name] = data.decode("utf-8", "replace")
     return fields, files
@@ -183,6 +211,68 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+        if u.path == "/batch":
+            bid = (qs.get("batch") or [""])[0]
+            jids = BATCHES.get(bid)
+            if not jids:
+                self._send_json({"error": "unknown batch"}, 404)
+                return
+            out = []
+            for jid in jids:
+                job = JOBS.get(jid)
+                if not job:
+                    continue
+                with LOCK:
+                    out.append({
+                        "id": jid,
+                        "name": job.get("name") or os.path.basename(job.get("media") or ""),
+                        "state": job["state"],
+                        "logs": job["logs"][-800:],
+                        "error": job["error"],
+                        "seg_count": job["seg_count"],
+                        "out_path": job["out_path"],
+                        "elapsed": job.get("elapsed", time.time() - job["t0"]),
+                        "has_result": job["result"] is not None,
+                    })
+            self._send_json({"batch": bid, "jobs": out})
+            return
+        if u.path == "/download_all":
+            bid = (qs.get("batch") or [""])[0]
+            jids = BATCHES.get(bid)
+            if not jids:
+                self._send_text("no batch", 404)
+                return
+            import io
+            import zipfile
+            buf = io.BytesIO()
+            used, n = {}, 0
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for jid in jids:
+                    job = JOBS.get(jid)
+                    if not job or not job.get("out_path") or not os.path.isfile(job["out_path"]):
+                        continue
+                    p = job["out_path"]
+                    base = os.path.basename(p)
+                    if base in used:
+                        used[base] += 1
+                        root, ext = os.path.splitext(base)
+                        base = "%s_%d%s" % (root, used[base], ext)
+                    else:
+                        used[base] = 0
+                    z.write(p, arcname=base)
+                    n += 1
+            if n == 0:
+                self._send_text("no file", 404)
+                return
+            data = buf.getvalue()
+            fn = "transcripts_%s.zip" % bid[:8]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % fn)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self._send_text("not found", 404)
 
     def do_POST(self):
@@ -194,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
         ctype = self.headers.get("Content-Type", "")
         body = self.rfile.read(length) if length else b""
 
-        fields, files = {}, {}
+        fields, files = {}, []
         if "multipart/form-data" in ctype:
             m = re.search(r'boundary=("?)([^";]+)\1', ctype)
             if m:
@@ -202,15 +292,24 @@ class Handler(BaseHTTPRequestHandler):
         else:
             fields = {k: v[0] for k, v in parse_qs(body.decode("utf-8", "replace")).items()}
 
-        media = (fields.get("path") or "").strip().strip('"').strip("'")
-        if "file" in files and files["file"][1]:
-            fn, data = files["file"]
-            safe = os.path.basename(fn) or "upload.bin"
+        # 收集待转写目标：路径（可多行，每行一个）+ 上传文件（可多个）
+        items = []
+        raw_paths = fields.get("paths") or fields.get("path") or ""
+        for line in re.split(r"[\r\n]+", raw_paths):
+            p = line.strip().strip('"').strip("'")
+            if p:
+                items.append((p, os.path.basename(p)))
+        for f in files:
+            if not f.get("data"):
+                continue
+            safe = os.path.basename(f["filename"]) or "upload.bin"
             media = os.path.join(TMP_DIR, uuid.uuid4().hex[:8] + "_" + safe)
-            with open(media, "wb") as f:
-                f.write(data)
+            with open(media, "wb") as fh:
+                fh.write(f["data"])
+            items.append((media, safe))
 
-        if not media or not os.path.isfile(media):
+        valid = [(m, n) for (m, n) in items if m and os.path.isfile(m)]
+        if not valid:
             self._send_json({"error": "请填写有效的文件路径，或上传文件"}, 400)
             return
 
@@ -224,8 +323,15 @@ class Handler(BaseHTTPRequestHandler):
             "model_dir": fields.get("model_dir") or None,
             "vad": not (fields.get("no_vad") in ("1", "true", "on")),
         }
-        jid = start_job(media, params)
-        self._send_json({"job_id": jid, "media": media})
+
+        batch_id = uuid.uuid4().hex[:12]
+        jobs, jids = [], []
+        for (m, n) in valid:
+            jid = start_job(m, params, batch_id=batch_id, name=n)
+            jids.append(jid)
+            jobs.append({"job_id": jid, "media": m, "name": n})
+        BATCHES[batch_id] = jids
+        self._send_json({"batch_id": batch_id, "jobs": jobs})
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -264,6 +370,22 @@ HTML_PAGE = r"""<!doctype html>
        border-radius:10px;font-size:14px;font-weight:600}
   .btn.ghost{background:transparent;border:1px solid #334155;color:#cbd5e1}
   .hint{color:#64748b;font-size:12px;margin-top:8px}
+  textarea{width:100%;padding:11px 12px;border-radius:9px;border:1px solid #334155;
+        background:#0b1220;color:#e2e8f0;font-size:14px;resize:vertical;font-family:inherit}
+  .drop{margin-top:8px;border:1px dashed #334155;border-radius:9px;padding:12px;text-align:center;
+        color:#64748b;font-size:12px}
+  .drop.on{border-color:#7c3aed;color:#c4b5fd;background:rgba(124,58,237,.08)}
+  .list{list-style:none;margin:0 0 10px;padding:0}
+  .item{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid #1e293b;
+        border-radius:9px;background:#0b1220;margin-bottom:8px;font-size:13px}
+  .item .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .item .st{color:#93c5fd;font-size:12px;white-space:nowrap}
+  .item.done .st{color:#4ade80}
+  .item.error .st{color:#f87171}
+  .item.running .st{color:#fbbf24}
+  .item a.mini{color:#60a5fa;text-decoration:none;font-size:12px;border:1px solid #334155;
+        padding:3px 10px;border-radius:7px}
+  .item a.mini:hover{background:#1e293b}
 </style>
 </head>
 <body>
@@ -272,12 +394,15 @@ HTML_PAGE = r"""<!doctype html>
   <p class="sub">本地 faster-whisper 引擎 · 全程离线 · 不消耗云端 token</p>
 
   <div class="card">
-    <label>媒体文件路径（推荐）</label>
-    <input type="text" id="path" placeholder="例如 D:\video.mp4 或 C:\Users\...\VID_1024.mp4">
+    <label>媒体文件路径（可选，支持多个，每行一个）</label>
+    <textarea id="paths" rows="3" placeholder="例如
+D:\video.mp4
+C:\Users\...\VID_1024.mp4"></textarea>
     <div class="row">
       <div>
-        <label>或上传文件（大文件较慢）</label>
-        <input type="file" id="file">
+        <label>或上传文件（可多选 / 可拖入，大文件较慢）</label>
+        <input type="file" id="file" multiple>
+        <div id="drop" class="drop">把文件拖到这里（可多个）</div>
       </div>
     </div>
     <div class="row">
@@ -311,16 +436,16 @@ HTML_PAGE = r"""<!doctype html>
     </div>
     <label class="chk"><input type="checkbox" id="no_vad"> 关闭静音过滤（VAD，一般不需要）</label>
     <button id="go">开始转写</button>
-    <div class="hint">首次加载模型需数秒；1 分钟音频约需 10~30 秒（CPU）。</div>
+    <div class="hint">可一次选择多个文件，将按顺序依次转写；首次加载模型需数秒，1 分钟音频约需 10~30 秒（CPU）。</div>
   </div>
 
   <div class="card" id="panel" style="display:none">
     <div class="bar"><span id="state">…</span><span id="timer"></span></div>
-    <pre id="log"></pre>
+    <ul id="list" class="list"></ul>
     <div id="actions" style="display:none">
-      <a id="dl" class="btn" href="#">⬇ 下载结果</a>
-      <button id="copy" class="btn ghost">复制全文</button>
+      <a id="dlall" class="btn" href="#">⬇ 全部下载 (zip)</a>
     </div>
+    <pre id="log"></pre>
   </div>
 </div>
 
@@ -328,16 +453,33 @@ HTML_PAGE = r"""<!doctype html>
 const $ = id => document.getElementById(id);
 let timer = null;
 
+// 拖拽放入文件选择框（支持多个）
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add('on');
+}));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove('on');
+}));
+drop.addEventListener('drop', e => {
+  if (e.dataTransfer && e.dataTransfer.files.length) $('file').files = e.dataTransfer.files;
+});
+
 $('go').onclick = async () => {
   const fd = new FormData();
-  fd.append('path', $('path').value.trim());
-  if ($('file').files[0]) fd.append('file', $('file').files[0]);
+  const paths = $('paths').value.trim();
+  if (paths) fd.append('paths', paths);
+  const fl = $('file').files;
+  for (let i = 0; i < fl.length; i++) fd.append('file', fl[i]);
   fd.append('format', $('format').value);
   fd.append('language', $('language').value);
   fd.append('model_size', $('model_size').value);
   if ($('no_vad').checked) fd.append('no_vad', '1');
 
   $('panel').style.display = 'block';
+  if (!paths && !fl.length) { $('state').textContent = '请先填写文件路径或选择文件'; return; }
+
+  $('list').innerHTML = '';
   $('log').textContent = '';
   $('actions').style.display = 'none';
   $('state').textContent = '提交中…';
@@ -354,42 +496,65 @@ $('go').onclick = async () => {
   const t0 = Date.now();
   clearInterval(timer);
   timer = setInterval(() => { $('timer').textContent = ((Date.now()-t0)/1000).toFixed(0) + ' s'; }, 200);
-  poll(j.job_id);
+  $('state').textContent = '共 ' + j.jobs.length + ' 个文件，依次转写中…';
+  pollBatch(j.batch_id, t0);
 };
 
-async function poll(id) {
-  let j;
-  try { j = await (await fetch('/status?id=' + id)).json(); }
-  catch (e) { setTimeout(() => poll(id), 1200); return; }
-
-  $('log').textContent = (j.logs || []).join('\n');
-  $('log').scrollTop = $('log').scrollHeight;
-
-  if (j.state === 'done') {
-    clearInterval(timer);
-    $('state').textContent = '✅ 完成 · ' + (j.seg_count || 0) + ' 段';
-    $('dl').href = '/download?id=' + id;
-    $('dl').setAttribute('download', (j.out_path || 'transcript.txt').split(/[\\/]/).pop());
-    $('actions').style.display = 'flex';
-    $('log').dataset.id = id;
-    $('go').disabled = false;
-  } else if (j.state === 'error') {
-    clearInterval(timer);
-    $('state').textContent = '❌ ' + j.error;
-    $('go').disabled = false;
-  } else {
-    $('state').textContent = '转写中…';
-    setTimeout(() => poll(id), 1000);
-  }
+function render(items) {
+  const ul = $('list');
+  ul.innerHTML = '';
+  items.forEach(it => {
+    const li = document.createElement('li');
+    li.className = 'item ' + it.state;
+    let st = '排队中';
+    if (it.state === 'running') st = '转写中…';
+    else if (it.state === 'done') st = '✅ 完成 · ' + (it.seg_count || 0) + ' 段';
+    else if (it.state === 'error') st = '❌ ' + (it.error || '失败');
+    const nm = document.createElement('span');
+    nm.className = 'nm'; nm.textContent = it.name;
+    const stEl = document.createElement('span');
+    stEl.className = 'st'; stEl.textContent = st;
+    li.appendChild(nm); li.appendChild(stEl);
+    if (it.state === 'done') {
+      const a = document.createElement('a');
+      a.className = 'mini'; a.href = '/download?id=' + it.id;
+      a.setAttribute('download', (it.out_path || 'transcript.txt').split(/[\\/]/).pop());
+      a.textContent = '下载'; li.appendChild(a);
+    }
+    ul.appendChild(li);
+  });
 }
 
-$('copy').onclick = async () => {
-  const id = $('log').dataset.id;
-  const t = await (await fetch('/result?id=' + id)).text();
-  try { await navigator.clipboard.writeText(t); } catch (e) {}
-  $('copy').textContent = '已复制 ✓';
-  setTimeout(() => $('copy').textContent = '复制全文', 1500);
-};
+async function pollBatch(bid, t0) {
+  let d;
+  try { d = await (await fetch('/batch?batch=' + bid)).json(); }
+  catch (e) { setTimeout(() => pollBatch(bid, t0), 1200); return; }
+
+  const items = d.jobs || [];
+  render(items);
+
+  const running = items.find(x => x.state === 'running')
+                  || items.filter(x => x.state === 'done' || x.state === 'error').slice(-1)[0];
+  if (running) {
+    try {
+      const s = await (await fetch('/status?id=' + running.id)).json();
+      $('log').textContent = (s.logs || []).join('\n');
+      $('log').scrollTop = $('log').scrollHeight;
+    } catch (e) {}
+  }
+
+  const doneAll = items.length && items.every(x => x.state === 'done' || x.state === 'error');
+  if (doneAll) {
+    clearInterval(timer);
+    const ok = items.filter(x => x.state === 'done').length;
+    const bad = items.length - ok;
+    $('state').textContent = '✅ 全部结束 · 成功 ' + ok + (bad ? (' / 失败 ' + bad) : '');
+    if (ok) { $('dlall').href = '/download_all?batch=' + bid; $('actions').style.display = 'flex'; }
+    $('go').disabled = false;
+  } else {
+    setTimeout(() => pollBatch(bid, t0), 1000);
+  }
+}
 </script>
 </body>
 </html>
